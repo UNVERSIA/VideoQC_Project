@@ -1,0 +1,103 @@
+name: Matrix Test and Build
+
+on: [push]
+
+jobs:
+  # === 第一阶段：全平台自动化测试 ===
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # 在这三个系统上分别运行测试
+        os: [windows-latest, ubuntu-latest, macos-latest]
+      fail-fast: false # 如果一个系统挂了，不要取消其他系统的测试（方便排查）
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # 统一使用 Python 3.8 进行测试，确保和打包环境一致
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: 🧪 Run Pytest
+        run: |
+          # 运行测试脚本
+          pytest -v tests/
+
+  # === 第二阶段：全平台打包 (依赖测试通过) ===
+  build:
+    name: Build on ${{ matrix.os }}
+    needs: test  # <--- 必须等上面的 test 任务全部绿了，这里才会开始
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+      fail-fast: false
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      # --- Windows 打包 ---
+      - name: Build on Windows
+        if: matrix.os == 'windows-latest'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: main
+          script-name: app.py
+          mode: onefile
+          enable-plugins: tk-inter
+          include-data-dir: static=static
+          output-file: VideoQC_Win7.exe
+
+      # --- Linux 打包 ---
+      - name: Build on Linux
+        if: matrix.os == 'ubuntu-latest'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: main
+          script-name: app.py
+          mode: onefile
+          enable-plugins: tk-inter
+          include-data-dir: static=static
+          output-file: VideoQC_Linux.bin
+
+      # --- macOS 打包 ---
+      - name: Build on macOS
+        if: matrix.os == 'macos-latest'
+        uses: Nuitka/Nuitka-Action@main
+        with:
+          nuitka-version: main
+          script-name: app.py
+          mode: onefile
+          enable-plugins: tk-inter
+          include-data-dir: static=static
+          output-file: VideoQC_Mac.bin
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoQC-${{ matrix.os }}
+          path: |
+            **/*.exe
+            **/*.bin
