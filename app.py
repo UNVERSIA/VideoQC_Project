@@ -7,10 +7,13 @@ import re
 import socket
 import threading
 import webbrowser
+import platform  # 用于判断系统
+import subprocess  # 用于调用 macOS 原生命令
 from threading import Timer
 import tkinter as tk
 from tkinter import filedialog
 from flask import Flask, render_template_string, request, jsonify, session, redirect
+
 
 def resource_path(relative_path):
     """获取资源的绝对路径 (适配 Nuitka 和 PyInstaller)"""
@@ -22,8 +25,9 @@ def resource_path(relative_path):
     full_path = os.path.join(base_path, relative_path)
     return full_path
 
+
 static_dir = resource_path('static')
-print(f"DEBUG: 正在从这里加载静态文件: {static_dir}")
+print(f"DEBUG: Static dir: {static_dir}")
 
 app = Flask(__name__, static_folder=static_dir)
 app.secret_key = 'video_qc_secret_key_2025'
@@ -39,10 +43,12 @@ STANDARDS = {
 }
 HISTORY_FILE = 'qc_history_db.json'
 
+DURATION_Threshold_Folder = 6 * 3600  # 单文件夹 6小时
+DURATION_Threshold_Avg = 7 * 3600  # 平均 7小时
+
 
 # 寻找空闲端口
 def find_free_port(start_port=5000):
-    """从 start_port 开始寻找一个未被占用的端口"""
     port = start_port
     while port < 65535:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -50,11 +56,11 @@ def find_free_port(start_port=5000):
             if result != 0:
                 return port
             else:
-                port += 1  
-    return 5000 
+                port += 1
+    return 5000
 
 
-# 后端
+# 后端存储
 def load_history():
     if os.path.exists(HISTORY_FILE):
         try:
@@ -72,17 +78,34 @@ def save_history_record(record):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
+# --- 核心修改 1：解决 macOS 崩溃问题 ---
 def open_folder_dialog():
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        folder_path = filedialog.askdirectory(title="选择文件夹")
-        root.destroy()
-        return folder_path
-    except Exception as e:
-        print(f"弹窗错误: {e}")
-        return ""
+    system_name = platform.system()
+
+    # 针对 macOS 使用 AppleScript
+    if system_name == 'Darwin':
+        try:
+            script = 'tell application "System Events" to return POSIX path of (choose folder with prompt "请选择包含视频的文件夹")'
+            result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            return ""
+        except Exception as e:
+            print(f"macOS Dialog Error: {e}")
+            return ""
+
+    # Windows / Linux 继续使用 Tkinter
+    else:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            folder_path = filedialog.askdirectory(title="选择文件夹")
+            root.destroy()
+            return folder_path
+        except Exception as e:
+            print(f"Tkinter Error: {e}")
+            return ""
 
 
 def clean_path(path_str):
@@ -148,7 +171,7 @@ def get_video_info(file_path):
         return None, str(e)
 
 
-# 前端
+# 前端模板 (增加了文件夹统计部分的展示逻辑)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -271,19 +294,19 @@ HTML_TEMPLATE = """
                             <div class="row mb-3">
                                 <div class="col-md-3">
                                     <div class="card card-custom p-3 border-start border-success border-5">
-                                        <h6 class="text-success text-uppercase">合格数量</h6>
+                                        <h6 class="text-success text-uppercase">合格视频</h6>
                                         <h2 id="passCount" class="fw-bold">0</h2>
                                     </div>
                                 </div>
                                 <div class="col-md-3">
                                     <div class="card card-custom p-3 border-start border-danger border-5">
-                                        <h6 class="text-danger text-uppercase">不合格数量</h6>
+                                        <h6 class="text-danger text-uppercase">不合格视频</h6>
                                         <h2 id="failCount" class="fw-bold">0</h2>
                                     </div>
                                 </div>
                                 <div class="col-md-6">
                                     <div class="card card-custom p-3 border-start border-info border-5">
-                                        <h6 class="text-info text-uppercase">时长统计 (HH:MM:SS)</h6>
+                                        <h6 class="text-info text-uppercase">视频时长 (HH:MM:SS)</h6>
                                         <div class="d-flex justify-content-between">
                                             <div><small class="text-muted d-block">总时长</small><span id="totalDuration" class="fw-bold fs-5">00:00:00</span></div>
                                             <div><small class="text-success d-block">有效时长</small><span id="validDuration" class="fw-bold fs-5 text-success">00:00:00</span></div>
@@ -292,6 +315,33 @@ HTML_TEMPLATE = """
                                     </div>
                                 </div>
                             </div>
+
+                            <div class="card card-custom p-4 mb-3 border-start border-warning border-5">
+                                <h5 class="fw-bold mb-3"><i class="bi bi-folder2-open text-warning"></i> 文件夹时长统计</h5>
+
+                                <div class="mb-3">
+                                    <span class="badge bg-dark me-2">平均标准: ≥7小时</span>
+                                    <span class="badge bg-secondary">单文件夹标准: ≥6小时</span>
+                                </div>
+
+                                <div class="row align-items-center mb-3">
+                                    <div class="col-md-4">
+                                        <h6 class="text-muted">平均时长 (所有文件夹)</h6>
+                                        <div id="avgFolderStatus"></div>
+                                    </div>
+                                </div>
+
+                                <h6 class="text-muted">各文件夹详情:</h6>
+                                <div class="table-responsive" style="max-height: 200px;">
+                                    <table class="table table-sm table-hover mb-0">
+                                        <thead class="table-light">
+                                            <tr><th>文件夹名称</th><th>总时长</th><th>状态</th></tr>
+                                        </thead>
+                                        <tbody id="folderTableBody"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+
                             <div class="row">
                                 <div class="col-md-6">
                                     <div class="card card-custom h-100">
@@ -396,6 +446,8 @@ HTML_TEMPLATE = """
     function renderResultTables(data) {
         document.getElementById('resultArea').style.display = 'block';
         const results = data.results;
+
+        // 渲染视频列表
         const passBody = document.getElementById('passTableBody');
         const failBody = document.getElementById('failTableBody');
         passBody.innerHTML = ''; failBody.innerHTML = '';
@@ -415,6 +467,38 @@ HTML_TEMPLATE = """
         document.getElementById('totalDuration').innerText = data.total_duration;
         document.getElementById('validDuration').innerText = data.valid_duration;
         document.getElementById('invalidDuration').innerText = data.invalid_duration;
+
+        // --- 新增：渲染文件夹统计 ---
+        const folderBody = document.getElementById('folderTableBody');
+        folderBody.innerHTML = '';
+
+        // 1. 文件夹列表
+        data.folder_results.forEach(f => {
+            const statusIcon = f.passed 
+                ? '<span class="badge bg-success">合格</span>' 
+                : '<span class="badge bg-danger">不合格 (不足6h)</span>';
+            const durationClass = f.passed ? 'text-dark' : 'text-danger fw-bold';
+
+            folderBody.innerHTML += `
+                <tr>
+                    <td class="fw-bold">${f.name}</td>
+                    <td class="${durationClass}">${f.duration_str}</td>
+                    <td>${statusIcon}</td>
+                </tr>
+            `;
+        });
+
+        // 2. 平均状态
+        const avgDiv = document.getElementById('avgFolderStatus');
+        const avgClass = data.global_stats.avg_passed ? 'text-success' : 'text-danger';
+        const avgIcon = data.global_stats.avg_passed ? '<i class="bi bi-check-circle-fill"></i>' : '<i class="bi bi-x-circle-fill"></i>';
+
+        avgDiv.innerHTML = `
+            <h3 class="${avgClass} fw-bold">
+                ${avgIcon} ${data.global_stats.avg_duration_str}
+            </h3>
+            <small class="text-muted">${data.global_stats.avg_passed ? '平均时长达标' : '平均时长未达标 (需≥7小时)'}</small>
+        `;
     }
 </script>
 </body>
@@ -422,7 +506,6 @@ HTML_TEMPLATE = """
 """
 
 
-# 路由
 @app.route('/', methods=['GET', 'POST'])
 def index(): return render_template_string(HTML_TEMPLATE, show_history=False)
 
@@ -464,6 +547,8 @@ def api_scan():
     if not os.path.isdir(path): return jsonify({'error': '请选择一个文件夹'}), 400
 
     results = []
+    folder_duration_map = {}
+
     filename_pattern = re.compile(r"^(.+)-(\d{6})-(\d{2})\.(mp4|mov|avi|mkv)$", re.IGNORECASE)
     found_videos = False
 
@@ -475,15 +560,39 @@ def api_scan():
                 if not match: return jsonify({'structure_error': True})
 
                 file_id, file_date = match.group(1), match.group(2)
+                # 检查目录结构是否匹配
                 if os.path.basename(root) != f"{file_id}-{file_date}":
                     return jsonify({'structure_error': True})
 
                 full_path = os.path.join(root, f)
                 info, err = get_video_info(full_path)
-                if info: results.append(info)
+                if info:
+                    results.append(info)
+                    current_duration = folder_duration_map.get(root, 0)
+                    folder_duration_map[root] = current_duration + info['duration_sec']
 
     if not found_videos: return jsonify({'error': '未找到视频文件'}), 404
 
+    # 1. 整理各文件夹结果
+    folder_results = []
+    total_folders_duration = 0
+
+    for folder_path, duration in folder_duration_map.items():
+        is_folder_passed = duration >= DURATION_Threshold_Folder  # 6小时
+        folder_results.append({
+            'name': os.path.basename(folder_path),
+            'duration_sec': duration,
+            'duration_str': format_duration(duration),
+            'passed': is_folder_passed
+        })
+        total_folders_duration += duration
+
+    # 2. 计算平均时长
+    num_folders = len(folder_duration_map)
+    avg_duration = total_folders_duration / num_folders if num_folders > 0 else 0
+    avg_passed = avg_duration >= DURATION_Threshold_Avg  # 7小时
+
+    # 3. 基础统计
     pass_cnt = sum(1 for r in results if r['passed'])
     total_sec = sum(r['duration_sec'] for r in results)
     valid_sec = sum(r['duration_sec'] for r in results if r['passed'])
@@ -499,13 +608,19 @@ def api_scan():
 
     return jsonify({
         'results': results,
+        'folder_results': folder_results,  
+        'global_stats': {  
+            'avg_duration_sec': avg_duration,
+            'avg_duration_str': format_duration(avg_duration),
+            'avg_passed': avg_passed,
+            'folder_count': num_folders
+        },
         'total_duration': format_duration(total_sec),
         'valid_duration': format_duration(valid_sec),
         'invalid_duration': format_duration(invalid_sec)
     })
 
 
-# 启动
 def open_browser(port):
     webbrowser.open_new(f'http://127.0.0.1:{port}/')
 
@@ -519,6 +634,5 @@ if __name__ == '__main__':
 
     if not os.environ.get("WERKZEUG_RUN_MAIN"):
         Timer(1.5, open_browser, [port]).start()
-
 
     app.run(host='0.0.0.0', port=port, debug=False)
